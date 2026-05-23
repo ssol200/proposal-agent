@@ -11,7 +11,7 @@ from supabase import create_client, Client
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext, Settings
 from llama_index.vector_stores.supabase import SupabaseVectorStore
 from llama_index.llms.google_genai import GoogleGenAI
-from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 # 기본 레이아웃 구성
 st.set_page_config(page_title="RFP 제안서 분석 & 생성 에이전트", layout="wide")
@@ -36,13 +36,15 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # 인공지능 모듈 선언
 @st.cache_resource
 def init_llama_index():
+    # LLM은 최신 Gemini 2.0 Flash 사용
     Settings.llm = GoogleGenAI(model="models/gemini-2.0-flash", api_key=GEMINI_API_KEY, temperature=0.2)
-    Settings.embed_model = GoogleGenAIEmbedding(model_name="models/embedding-001", api_key=GEMINI_API_KEY)
+    # 🔥 구글 API 버전 에러 방지를 위해 가장 안정적인 글로벌 오픈소스 임베딩 모델로 변경 (차원: 384)
+    Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
 init_llama_index()
 
 st.title("💼 조달청 RFP 분석 및 제안서 생성 AI Agent")
-st.markdown("나라장터 제안요청서(RFP)를 분석하여 제안서 초안 작성 및 요구사항 충족률을 검증합니다.")
+st.markdown("나라장터 제안요청서(RFP)를 분석하여 제안서 초안 작성 및 요구사항 충춤률을 검증합니다.")
 
 tab1, tab2, tab3 = st.tabs(["📥 RFP 업로드 및 설정", "✨ 제안서 생성 & 검토", "📜 히스토리"])
 
@@ -59,7 +61,7 @@ with tab1:
     with col1:
         st.subheader("🏢 제안사 정보 입력")
         company_name = st.text_input("회사명", value="미래 혁신 테크", key="comp_name")
-        company_spec = st.text_area("회사 주요 역량 및 기술 스택", value="클라우드 네이티브 아키텍처 구축 전문, MSA 설계 노하우 보유.", height=150)
+        company_spec = st.text_area("회사 주요 역량", value="클라우드 네이티브 아키텍처 구축 전문, MSA 설계 노하우 보유.", height=150)
         if st.button("💾 회사 정보 저장"):
             st.success("정보가 에이전트에 반영되었습니다.")
             
@@ -69,7 +71,7 @@ with tab1:
         if rfp_file is not None:
             st.info(f"선택된 파일: {rfp_file.name}")
             if st.button("🔍 RFP 지식화 및 인덱싱 시작"):
-                with st.spinner("LlamaIndex 연동 및 Supabase 저장 진행 중..."):
+                with st.spinner("LlamaIndex 가동 및 Supabase 벡터 저장 중..."):
                     try:
                         with tempfile.TemporaryDirectory() as tmpdir:
                             filepath = os.path.join(tmpdir, rfp_file.name)
@@ -82,7 +84,7 @@ with tab1:
                             vector_store = SupabaseVectorStore(
                                 postgres_connection_string=DB_CONNECTION,
                                 collection_name="data_rfp_vectors",
-                                dimension=768
+                                dimension=384
                             )
                             storage_context = StorageContext.from_defaults(vector_store=vector_store)
                             index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
@@ -126,7 +128,7 @@ with tab2:
                 compliance_result = [{"요구사항": "클라우드 구축 규격 부합성", "충족여부": True, "이유": "회사 역량 기반 충족"}]
                 fulfillment_rate = 100.0
 
-                status.update(label="4단계: 최종 산출물 Supabase 클라우드 저장 중...")
+                status.update(label="4단계: 최종 산출물 데이터베이스 저장 중...")
                 proposal_data = {
                     "rfp_name": st.session_state.rfp_name,
                     "company_name": company_name,
