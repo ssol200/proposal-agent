@@ -9,4 +9,4 @@ supabase==2.4.1
 python-docx==1.1.0
 fpdf2==2.7.8
 pydantic==2.6.3
-vecs==0.4.0
+vecs==0.4.2
