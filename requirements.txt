@@ -12,5 +12,3 @@ langchain
 langchain-google-genai
 python-docx
 fpdf2
-langchain
-langchain-google-genai
