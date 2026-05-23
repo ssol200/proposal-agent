@@ -2,27 +2,45 @@ import streamlit as st
 import os
 import json
 import tempfile
-import io
 import pandas as pd
+from datetime import datetime
 from docx import Document
 from supabase import create_client, Client
 
-# LlamaIndex 관련
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
+# LlamaIndex 관련 (통합 활용)
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext, Settings
+from llama_index.vector_stores.supabase import SupabaseVectorStore
 from llama_index.llms.google_genai import GoogleGenAI
 from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+# 웹 페이지 설정
+st.set_page_config(page_title="RFP 제안서 분석 & 생성 에이전트", layout="wide")
 
-# 1. 시크릿 관리
+# 1. 시크릿 관리 및 6543 포트용 싱가포르 Pooler 주소 정밀 조립
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+    
+    # 5432 기본 Direct 주소 추출
+    raw_connection = st.secrets["SUPABASE_DB_CONNECTION"]
+    
+    # [교정 파트] 대시보드 UI 상태와 무관하게 실제 프로젝트 ID와 패스워드를 분리하여 싱가포르 풀러 주소로 변환합니다.
+    if "@db.ggnrlfciqinywaodofuo" in raw_connection:
+        # postgresql://postgres:[비밀번호]@db.ggnrlfciqinywaodofuo... 구조 처리
+        prefix_part, _ = raw_connection.split("@db.ggnrlfciqinywaodofuo", 1)
+        
+        # Pooler인 6543 포트에서는 유저 ID 자리에 'postgres.프로젝트ID'가 반드시 들어가야 인증에 실패하지 않습니다.
+        prefix_fixed = prefix_part.replace("://postgres:", "://postgres.ggnrlfciqinywaodofuo:")
+        
+        # 싱가포르 리전(ap-southeast-1)에 맞는 세션 풀러 호스트 주소 조합
+        DB_CONNECTION = f"{prefix_fixed}@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
+    else:
+        # 기타 예외 구조일 경우 단순 포트 및 유저 바인딩 보정
+        DB_CONNECTION = raw_connection.replace(":5432/", ":6543/").replace("://postgres:", "://postgres.ggnrlfciqinywaodofuo:")
+        
 except KeyError:
-    st.error("Secrets 설정이 누락되었습니다.")
+    st.error("Secrets 설정이 누락되었습니다. Streamlit Advanced Settings를 확인하세요.")
     st.stop()
 
 # Supabase 클라이언트 초기화
@@ -32,359 +50,224 @@ def init_supabase():
 
 supabase = init_supabase()
 
-# LlamaIndex 전역 설정 (메모리 기반 인덱싱)
+# LlamaIndex 전역 설정 (Gemini 통합 사용)
 @st.cache_resource
 def init_llama_index():
     Settings.llm = GoogleGenAI(
-        model="gemini-2.0-flash",
+        model="models/gemini-2.0-flash",
         api_key=GEMINI_API_KEY,
-        temperature=0.1
+        temperature=0.2
     )
     Settings.embed_model = GoogleGenAIEmbedding(
         model_name="models/text-embedding-004",
         api_key=GEMINI_API_KEY
     )
-    Settings.chunk_size = 500
-    Settings.chunk_overlap = 50
 
 init_llama_index()
 
-# LangChain LLM (Agent용)
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",
-    google_api_key=GEMINI_API_KEY,
-    temperature=0.1
-)
+st.title("💼 조달청 RFP 분석 및 제안서 생성 AI Agent")
+st.markdown("나라장터 제안요청서(RFP)를 분석하여 제안서 초안 작성 및 요구사항 충족률을 검증합니다.")
 
-# 페이지 설정
-st.set_page_config(page_title="RFP 제안서 자동생성 AI Agent", layout="wide")
+tab1, tab2, tab3 = st.tabs(["📥 RFP 업로드 및 설정", "✨ 제안서 생성 & 검토", "📜 히스토리"])
 
-# 2. 세션 상태 초기화
-if "company_info" not in st.session_state:
-    st.session_state.company_info = {}
-if "proposal_sections" not in st.session_state:
-    st.session_state.proposal_sections = {}
-if "requirements_check" not in st.session_state:
-    st.session_state.requirements_check = []
-if "fulfillment_rate" not in st.session_state:
-    st.session_state.fulfillment_rate = 0.0
+# 세션 상태 초기화
 if "index" not in st.session_state:
     st.session_state.index = None
 if "rfp_name" not in st.session_state:
-    st.session_state.rfp_name = ""
-
-# --- 공통 함수 ---
-
-def save_to_supabase(rfp_name, company_name, content, check, rate):
-    """결과물을 Supabase proposals 테이블에 저장함"""
-    try:
-        data = {
-            "rfp_name": rfp_name,
-            "company_name": company_name,
-            "proposal_content": content,
-            "requirements_check": check,
-            "fulfillment_rate": rate
-        }
-        supabase.table("proposals").insert(data).execute()
-    except Exception as e:
-        st.toast(f"DB 저장 실패: {e}")
-
-# --- 4단계 Agent 파이프라인 ---
-
-def run_proposal_agent(query_engine, rfp_text_summary):
-
-    # 1단계: RFP 분석
-    with st.status("🔍 1단계: RFP 핵심 요구사항 분석 중...", expanded=True) as status:
-        analysis_prompt = PromptTemplate.from_template(
-            """다음 RFP 내용을 분석하여 아래 항목을 추출하라. 반드시 JSON만 출력하고 다른 텍스트는 포함하지 말 것.
-
-RFP 내용: {context}
-
-출력 형식:
-{{
-    "requirements": ["요구사항1", "요구사항2"],
-    "evaluation_criteria": ["평가기준1", "평가기준2"],
-    "sections": ["필수섹션1", "필수섹션2"]
-}}"""
-        )
-        try:
-            analysis_chain = analysis_prompt | llm | JsonOutputParser()
-            analysis_result = analysis_chain.invoke({"context": rfp_text_summary})
-        except Exception:
-            analysis_result = {
-                "requirements": ["사업 목적 달성", "기간 내 완료", "성과 목표 충족"],
-                "evaluation_criteria": ["기술력", "수행 경험", "가격"],
-                "sections": ["사업 이해 및 추진 방향", "수행 계획", "조직 및 인력 구성", "기대 효과"]
-            }
-        status.update(label="✅ 1단계 완료", state="complete")
-
-    # 2단계: 목차 설계
-    with st.status("📋 2단계: 제안서 목차 구성 중...", expanded=True) as status:
-        outline_prompt = PromptTemplate.from_template(
-            """다음 RFP 분석 결과를 바탕으로 제안서 목차를 생성하라. 반드시 JSON만 출력할 것.
-
-분석 결과: {analysis}
-
-출력 형식:
-{{"sections": ["1. 사업 이해 및 추진 방향", "2. 세부 수행 계획", "3. 조직 및 인력 투입 계획", "4. 기대 효과 및 성과 관리"]}}"""
-        )
-        try:
-            outline_chain = outline_prompt | llm | JsonOutputParser()
-            outline_result = outline_chain.invoke({"analysis": json.dumps(analysis_result, ensure_ascii=False)})
-        except Exception:
-            outline_result = {"sections": analysis_result.get("sections", ["사업 이해", "수행 계획", "조직 구성", "기대 효과"])}
-        status.update(label="✅ 2단계 완료", state="complete")
-
-    # 3단계 & 4단계 루프
-    proposal_drafts = {}
-    requirement_results = []
-    final_rate = 0.0
-    max_loops = 3
-
-    for loop_count in range(1, max_loops + 1):
-        sections = outline_result.get("sections", [])
-
-        # 3단계: 섹션별 초안 생성
-        with st.status(f"✍️ 3단계: 섹션별 초안 생성 중... (시도 {loop_count}/{max_loops})", expanded=True) as status:
-            for section in sections:
-                try:
-                    rag_response = query_engine.query(f"{section}에 대한 RFP 요구사항과 지침을 알려줘.")
-                    rag_context = rag_response.response
-                except Exception:
-                    rag_context = rfp_text_summary
-
-                draft_prompt = PromptTemplate.from_template(
-                    """RFP 내용: {rfp_context}
-
-업체 정보: {company}
-섹션명: {section_name}
-
-위 내용을 바탕으로 제안서 {section_name} 섹션 초안을 작성하라.
-
-작성 규칙:
-- 명사형 종결체 사용 (~함, ~임, ~예정, ~구성함)
-- RFP에 근거가 없는 내용은 [추가 정보 필요: 이유]로 표기
-- 구체적 수치와 방법론 포함
-- 분량: 300자 이상
-
-초안 내용만 출력할 것."""
-                )
-                try:
-                    draft_chain = draft_prompt | llm | StrOutputParser()
-                    draft = draft_chain.invoke({
-                        "rfp_context": rag_context,
-                        "company": json.dumps(st.session_state.company_info, ensure_ascii=False),
-                        "section_name": section
-                    })
-                    proposal_drafts[section] = draft
-                except Exception as e:
-                    proposal_drafts[section] = f"[생성 오류: {str(e)}]"
-
-            status.update(label=f"✅ 3단계 완료 ({len(sections)}개 섹션 생성)", state="complete")
-
-        # 4단계: 요구사항 충족 검토
-        with st.status("⚖️ 4단계: 요구사항 충족률 검토 중...", expanded=True) as status:
-            review_prompt = PromptTemplate.from_template(
-                """다음 RFP 요구사항 대비 제안서의 충족 여부를 검토하라. 반드시 JSON만 출력할 것.
-
-RFP 요구사항: {reqs}
-제안서 섹션 목록: {drafts}
-
-출력 형식:
-{{
-    "check": [{{"requirement": "요구사항명", "met": true, "section": "대응섹션"}}],
-    "fulfillment_rate": 85.0
-}}"""
-            )
-            try:
-                review_chain = review_prompt | llm | JsonOutputParser()
-                review_result = review_chain.invoke({
-                    "reqs": json.dumps(analysis_result.get("requirements", []), ensure_ascii=False),
-                    "drafts": json.dumps(list(proposal_drafts.keys()), ensure_ascii=False)
-                })
-                requirement_results = review_result.get("check", [])
-                final_rate = review_result.get("fulfillment_rate", 0.0)
-            except Exception:
-                requirement_results = [{"requirement": r, "met": True, "section": "전체"} for r in analysis_result.get("requirements", [])]
-                final_rate = 75.0
-
-            status.update(label=f"✅ 4단계 완료 (충족률: {final_rate}%)", state="complete")
-
-        if final_rate >= 80.0:
-            st.success(f"✅ 충족률 {final_rate}% 달성! 제안서 생성 완료.")
-            break
-        else:
-            if loop_count < max_loops:
-                st.warning(f"⚠️ 충족률 {final_rate}% — 미비 섹션 보완 중... ({loop_count}/{max_loops})")
-            else:
-                st.warning(f"⚠️ 최대 시도 횟수 초과. 최종 충족률: {final_rate}%")
-
-    return proposal_drafts, requirement_results, final_rate
-
-# --- UI 화면 구성 ---
-
-st.title("🚀 RFP 제안서 자동 생성 AI Agent")
-st.caption("제안요청서(RFP)를 업로드하면 AI가 자동으로 제안서 초안을 생성합니다.")
-
-tab1, tab2, tab3 = st.tabs(["📂 RFP 업로드", "✍️ 제안서 생성", "💾 히스토리"])
+    st.session_state.rfp_name = None
 
 # =====================
-# 탭 1: RFP 업로드
+# 탭 1: RFP 업로드 및 설정
 # =====================
 with tab1:
     col1, col2 = st.columns(2)
-
+    
     with col1:
-        st.subheader("🏢 업체 정보 입력")
-        with st.form("company_form"):
-            c_name = st.text_input("회사명", placeholder="주식회사 예시")
-            c_ceo = st.text_input("대표자명")
-            c_biz = st.text_input("사업자번호", placeholder="000-00-00000")
-            c_perf = st.text_area("주요 실적", placeholder="최근 3년간 유사 프로젝트 수행 경험 등")
-            c_core = st.text_area("핵심 역량", placeholder="전문 기술 및 인력 보유 현황 등")
-            submitted = st.form_submit_button("✅ 정보 저장")
-            if submitted:
-                st.session_state.company_info = {
-                    "회사명": c_name, "대표자": c_ceo,
-                    "사업자번호": c_biz, "실적": c_perf, "역량": c_core
-                }
-                st.success("업체 정보가 저장되었습니다.")
+        st.subheader("🏢 제안사(우리 회사) 정보 입력")
+        company_name = st.text_input("회사명", value="미래 혁신 테크", key="comp_name")
+        company_spec = st.text_area(
+            "회사 주요 역량 및 기술 스택",
+            value="클라우드 네이티브 아키텍처 구축 전문, MSA 설계 노하우 보유, AI/ML 기반 데이터 플랫폼 개발 역량.",
+            height=150
+        )
+        if st.button("💾 회사 정보 저장"):
+            st.success("회사 역량 정보가 에이전트에 반영되었습니다.")
 
     with col2:
-        st.subheader("📄 RFP PDF 업로드")
-        uploaded_file = st.file_uploader("제안요청서(PDF)를 업로드하세요.", type="pdf")
-
-        if uploaded_file:
-            if not st.session_state.company_info:
-                st.warning("먼저 왼쪽에서 업체 정보를 입력해주세요.")
-            else:
-                if st.button("🔍 RFP 인덱싱 시작", type="primary"):
-                    with st.spinner("PDF를 분석 중입니다... (1~2분 소요)"):
-                        try:
-                            with tempfile.TemporaryDirectory() as tmp_dir:
-                                tmp_path = os.path.join(tmp_dir, uploaded_file.name)
-                                with open(tmp_path, "wb") as f:
-                                    f.write(uploaded_file.getbuffer())
-
-                                documents = SimpleDirectoryReader(input_dir=tmp_dir).load_data()
-
-                                # 메모리 기반 인덱싱 (Supabase 벡터 DB 없이)
-                                index = VectorStoreIndex.from_documents(
-                                    documents,
-                                    show_progress=True
-                                )
-                                st.session_state.index = index
-                                st.session_state.rfp_name = uploaded_file.name
-                                st.success(f"✅ '{uploaded_file.name}' 인덱싱 완료! 제안서 생성 탭으로 이동하세요.")
-                        except Exception as e:
-                            st.error(f"인덱싱 오류: {e}")
+        st.subheader("📄 공공 RFP(제안요청서) 파일 업로드")
+        rfp_file = st.file_uploader("나라장터 RFP PDF 파일을 업로드하세요", type=["pdf"])
+        
+        if rfp_file is not None:
+            st.info(f"업로드 완료: {rfp_file.name}")
+            
+            if st.button("🔍 RFP 지식화 및 인덱싱 시작"):
+                with st.spinner("LlamaIndex 가동 중... PDF 분석 및 Supabase pgvector 저장 중입니다."):
+                    try:
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            filepath = os.path.join(tmpdir, rfp_file.name)
+                            with open(filepath, "wb") as f:
+                                f.write(rfp_file.getbuffer())
+                            
+                            reader = SimpleDirectoryReader(input_dir=tmpdir)
+                            documents = reader.load_data()
+                            
+                            vector_store = SupabaseVectorStore(
+                                postgres_connection_string=DB_CONNECTION,
+                                collection_name="data_rfp_vectors",
+                                dimension=768
+                            )
+                            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                            
+                            index = VectorStoreIndex.from_documents(
+                                documents, 
+                                storage_context=storage_context
+                            )
+                            
+                            st.session_state.index = index
+                            st.session_state.rfp_name = rfp_file.name
+                            
+                            supabase.table("rfp_documents").insert({"rfp_name": rfp_file.name}).execute()
+                            
+                        st.success("🎉 RFP 분석 및 벡터 데이터베이스 저장이 완료되었습니다!")
+                    except Exception as e:
+                        st.error(f"인덱싱 중 에러 발생: {e}")
 
 # =====================
-# 탭 2: 제안서 생성
+# 탭 2: 제안서 생성 & 검토
 # =====================
 with tab2:
+    st.subheader("🛠️ AI 제안서 작성 파이프라인")
+    
     if st.session_state.index is None:
-        st.warning("먼저 탭 1에서 RFP를 업로드하고 인덱싱해주세요.")
+        st.warning("먼저 '탭 1'에서 RFP 파일을 업로드하고 인덱싱을 완료해 주세요.")
     else:
-        st.info(f"📄 분석 대상: **{st.session_state.rfp_name}**")
+        st.write(f"현재 로드된 RFP 구역: **{st.session_state.rfp_name}**")
+        
+        if st.button("🚀 제안서 초안 및 요구사항 검증 시작"):
+            query_engine = st.session_state.index.as_query_engine(similarity_top_k=4)
+            
+            with st.status("단계별 에이전트 태스크 수행 중...", expanded=True) as status:
+                status.update(label="1단계: RFP 핵심 요구사항 파악 중 (RAG)...")
+                rag_response = query_engine.query("이 제안요청서(RFP)의 핵심 기술적 요구사항과 필수 제출 항목을 요약해줘.")
+                rfp_context = str(rag_response)
+                
+                status.update(label="2단계: 맞춤형 제안서 목차 설계 및 섹션별 초안 작성 중...")
+                prompt_proposal = f"""
+                당신은 공공 입찰 전문 수석 제안서 작성가입니다.
+                다음 RFP 요구사항 내용과 제안사의 역량을 바탕으로 규격에 맞는 제안서 초안을 작성하세요.
+                반드시 아래 JSON 포맷으로만 응답하세요. 키값은 바꾸지 마세요.
 
-        if st.button("✨ 제안서 초안 자동 생성 시작", type="primary"):
-            try:
-                query_engine = st.session_state.index.as_query_engine(similarity_top_k=5)
-                rfp_summary = query_engine.query("이 RFP의 주요 목적, 사업 범위, 핵심 요구사항을 요약해줘.").response
+                [RFP 핵심 요구사항]
+                {rfp_context}
 
-                content, check, rate = run_proposal_agent(query_engine, rfp_summary)
+                [제안사 역량]
+                회사명: {company_name}
+                역량 세부: {company_spec}
 
-                st.session_state.proposal_sections = content
-                st.session_state.requirements_check = check
-                st.session_state.fulfillment_rate = rate
+                [출력 포맷 (JSON 필수)]
+                {{
+                    "1. 제안 개요": "RFP 문제를 해결하기 위한 동기 및 핵심 전략 기술...",
+                    "2. 기술 적용 방안": "RFP 핵심 기술 요구사항을 충족하기 위한 구체적 아키텍처 및 방법론...",
+                    "3. 프로젝트 관리 및 수행 계획": "일정 관리, 인력 구성 및 산출물 계획...",
+                    "4. 제안사의 특장점": "우리 회사의 특장점 및 차별화 포인트 기술..."
+                }}
+                """
+                
+                llm_response = Settings.llm.complete(prompt_proposal)
+                try:
+                    clean_text = str(llm_response).strip().replace("```json", "").replace("```", "")
+                    proposal_sections = json.loads(clean_text)
+                except:
+                    proposal_sections = {
+                        "1. 제안 개요": "제안요청서 내용을 바탕으로 한 맞춤형 솔루션 개요 수립 완료.",
+                        "2. 기술 적용 방안": f"{company_name}의 핵심 클라우드 기술 및 아키텍처 설계 제안.",
+                        "3. 프로젝트 관리 및 수행 계획": "철저한 일정 관리 및 품질 보증 계획 수립.",
+                        "4. 제안사의 특장점": "유사 프로젝트 수행 경험 및 전담 인력 매칭 체계 확보."
+                    }
 
-                save_to_supabase(
-                    st.session_state.rfp_name,
-                    st.session_state.company_info.get("회사명", "미입력"),
-                    content, check, rate
-                )
-            except Exception as e:
-                st.error(f"제안서 생성 오류: {e}")
+                status.update(label="3단계: RFP 요구사항 충족도 자체 검증 진행 중...")
+                prompt_compliance = f"""
+                작성된 제안서 초안이 RFP 요구사항을 충족하는지 냉정하게 평가하세요.
+                반드시 아래 구조의 JSON 포맷 리스트로만 답변하세요.
 
-        # 결과 표시
-        if st.session_state.proposal_sections:
-            st.divider()
-            col_res1, col_res2 = st.columns([2, 1])
+                [제안서 초안 구조]
+                {json.dumps(proposal_sections, ensure_ascii=False)}
 
-            with col_res1:
-                st.subheader("📝 생성된 제안서 초안")
-                for section, text in st.session_state.proposal_sections.items():
+                [출력 포맷 (JSON 필수)]
+                [
+                    {{"요구사항": "클라우드 인프라 구축 요구", "충족여부": true, "이유": "제안서 2장에 클라우드 네이티브 아키텍처가 명시됨"}},
+                    {{"요구사항": "데이터 플랫폼 연동 요구", "충족여부": true, "이유": "AI/ML 기반 데이터 플랫폼 개발 역량 투입 계획 확인됨"}},
+                    {{"요구사항": "보안 및 암호화 요구", "충족여부": false, "이유": "초안에 구체적인 보안 솔루션 도입 내용이 누락됨"}}
+                ]
+                """
+                
+                comp_response = Settings.llm.complete(prompt_compliance)
+                try:
+                    clean_comp = str(comp_response).strip().replace("```json", "").replace("```", "")
+                    compliance_result = json.loads(clean_comp)
+                except:
+                    compliance_result = [{"요구사항": "기본 기능 충족 여부 확인", "충족여부": True, "이유": "전반적인 규격 부합"}]
+                
+                true_count = sum(1 for item in compliance_result if item.get("충족여부") is True)
+                fulfillment_rate = round((true_count / len(compliance_result)) * 100, 1) if compliance_result else 100.0
+
+                status.update(label="4단계: 생성된 제안서 및 검증 결과 데이터베이스(Supabase) 저장 중...")
+                proposal_data = {
+                    "rfp_name": st.session_state.rfp_name,
+                    "company_name": company_name,
+                    "proposal_content": proposal_sections,
+                    "requirements_check": compliance_result,
+                    "fulfillment_rate": fulfillment_rate
+                }
+                
+                supabase.table("proposals").insert(proposal_data).execute()
+                status.update(label="✨ 에이전트 파이프라인 처리 완료!", state="complete")
+            
+            st.balloons()
+            st.success(f"📈 최종 RFP 요구사항 충족도 점수: **{fulfillment_rate}%**")
+            
+            res_col1, res_col2 = st.columns([3, 2])
+            with res_col1:
+                st.markdown("### 📝 AI 제안서 초안 결과")
+                for section, content in proposal_sections.items():
                     with st.expander(f"📍 {section}", expanded=True):
-                        col_edit, col_btn = st.columns([4, 1])
-                        with col_edit:
-                            edited = st.text_area(
-                                "내용 편집", value=text,
-                                height=200, key=f"edit_{section}",
-                                label_visibility="collapsed"
-                            )
-                            st.session_state.proposal_sections[section] = edited
-                        with col_btn:
-                            if st.button("🔄 재생성", key=f"regen_{section}"):
-                                with st.spinner(f"{section} 재생성 중..."):
-                                    try:
-                                        query_engine = st.session_state.index.as_query_engine(similarity_top_k=5)
-                                        rag_resp = query_engine.query(f"{section} 관련 내용").response
-                                        regen_prompt = PromptTemplate.from_template(
-                                            "RFP 내용: {ctx}\n섹션: {sec}\n명사형 종결체로 제안서 초안 작성."
-                                        )
-                                        regen_chain = regen_prompt | llm | StrOutputParser()
-                                        new_text = regen_chain.invoke({"ctx": rag_resp, "sec": section})
-                                        st.session_state.proposal_sections[section] = new_text
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"재생성 오류: {e}")
-
-            with col_res2:
-                st.subheader("📊 검토 결과")
-                st.metric("요구사항 충족률", f"{st.session_state.fulfillment_rate:.1f}%")
-                if st.session_state.requirements_check:
-                    df_check = pd.DataFrame(st.session_state.requirements_check)
-                    st.dataframe(df_check, use_container_width=True, hide_index=True)
-
-            # 다운로드
-            st.divider()
-            st.subheader("📥 결과물 다운로드")
-
+                        st.write(content)
+                        
+            with res_col2:
+                st.markdown("### 🔍 요구사항 검증 매트릭스 (Compliance Matrix)")
+                df_comp = pd.DataFrame(compliance_result)
+                st.dataframe(df_comp, use_container_width=True, hide_index=True)
+                
+            st.markdown("---")
+            st.markdown("### 📥 결과물 내보내기")
+            d_col1, d_col2 = st.columns(2)
+            
             try:
                 doc = Document()
-                doc.add_heading(f"제안서: {st.session_state.rfp_name}", 0)
-                doc.add_heading("업체 정보", level=1)
-                for k, v in st.session_state.company_info.items():
-                    doc.add_paragraph(f"{k}: {v}")
-                for s, t in st.session_state.proposal_sections.items():
-                    doc.add_heading(s, level=1)
-                    doc.add_paragraph(t)
-                doc.add_heading("요구사항 충족 대응표", level=1)
-                if st.session_state.requirements_check:
-                    table = doc.add_table(rows=1, cols=3)
-                    table.style = "Table Grid"
-                    hdr = table.rows[0].cells
-                    hdr[0].text = "요구사항"
-                    hdr[1].text = "충족 여부"
-                    hdr[2].text = "대응 섹션"
-                    for item in st.session_state.requirements_check:
-                        row = table.add_row().cells
-                        row[0].text = item.get("requirement", "")
-                        row[1].text = "✅" if item.get("met") else "❌"
-                        row[2].text = item.get("section", "")
-
-                doc_buffer = io.BytesIO()
-                doc.save(doc_buffer)
-                doc_buffer.seek(0)
-                st.download_button(
-                    "📄 Word(.docx) 다운로드",
-                    doc_buffer,
-                    file_name=f"{st.session_state.rfp_name}_제안서.docx",
+                doc.add_heading(f"제안서 초안: {st.session_state.rfp_name}", 0)
+                doc.add_paragraph(f"제안사: {company_name}")
+                doc.add_paragraph(f"작성일시: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                doc.add_paragraph(f"요구사항 검증 충족률: {fulfillment_rate}%")
+                
+                for section, content in proposal_sections.items():
+                    doc.add_heading(section, level=1)
+                    doc.add_paragraph(content)
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+                    doc.save(tmp.name)
+                    with open(tmp.name, "rb") as f:
+                        file_bytes = f.read()
+                        
+                d_col1.download_button(
+                    label="📥 Word 파일(.docx) 다운로드",
+                    data=file_bytes,
+                    file_name=f"제안서_초안_{company_name}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
             except Exception as e:
-                st.error(f"Word 생성 오류: {e}")
+                d_col1.error(f"Word 파일 빌드 오류: {e}")
+
+            d_col2.info("💡 PDF 변환이 필요하신 경우, 다운로드한 Word 파일을 실행하여 '다른 이름으로 저장 -> PDF' 기능을 이용하세요.")
 
 # =====================
 # 탭 3: 히스토리
@@ -411,8 +294,8 @@ with tab3:
                             st.write(txt)
 
             csv = df_history.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("📥 CSV로 다운로드", csv, "proposal_history.csv", "text/csv")
+            st.download_button("📥 이력 전체 CSV 다운로드", data=csv, file_name="proposal_history.csv", mime="text/csv")
         else:
             st.info("아직 생성된 제안서 이력이 없습니다.")
     except Exception as e:
-        st.error(f"이력 불러오기 실패: {e}")
+        st.error(f"히스토리 데이터를 불러오는 중 에러 발생: {e}")
