@@ -16,29 +16,33 @@ from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 # 웹 페이지 설정
 st.set_page_config(page_title="RFP 제안서 분석 & 생성 에이전트", layout="wide")
 
-# 1. 시크릿 관리 및 6543 포트용 싱가포르 Pooler 주소 정밀 조립
+# 프로젝트 정보 고정 설정
+PROJECT_ID = "ggnrlfciqinywaodofuo"
+
+# 1. 시크릿 관리 및 6543 포트용 싱가포르 Pooler 주소 수동 강제 조립
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-    
-    # 5432 기본 Direct 주소 추출
     raw_connection = st.secrets["SUPABASE_DB_CONNECTION"]
     
-    # [교정 파트] 대시보드 UI 상태와 무관하게 실제 프로젝트 ID와 패스워드를 분리하여 싱가포르 풀러 주소로 변환합니다.
-    if "@db.ggnrlfciqinywaodofuo" in raw_connection:
-        # postgresql://postgres:[비밀번호]@db.ggnrlfciqinywaodofuo... 구조 처리
-        prefix_part, _ = raw_connection.split("@db.ggnrlfciqinywaodofuo", 1)
-        
-        # Pooler인 6543 포트에서는 유저 ID 자리에 'postgres.프로젝트ID'가 반드시 들어가야 인증에 실패하지 않습니다.
-        prefix_fixed = prefix_part.replace("://postgres:", "://postgres.ggnrlfciqinywaodofuo:")
-        
-        # 싱가포르 리전(ap-southeast-1)에 맞는 세션 풀러 호스트 주소 조합
-        DB_CONNECTION = f"{prefix_fixed}@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
+    # 1단계: 원래 주소에서 비밀번호 부분만 정확하게 도려냅니다.
+    # postgresql://postgres:[비밀번호]@db.ggnrlfciqinywaodofuo... 또는 pooler 구조 대응
+    try:
+        pw_step1 = raw_connection.split("://postgres:", 1)[1]
+        DB_PASSWORD = pw_step1.split("@", 1)[0]
+    except Exception:
+        # 혹시 분리에 실패할 경우 원본을 그대로 씁니다.
+        DB_CONNECTION = raw_connection
+        DB_PASSWORD = None
+
+    if DB_PASSWORD:
+        # 2단계: 에러를 유발하는 기존 user("postgres") 대신 "postgres.프로젝트ID"로 유저명을 교체하고, 
+        # 싱가포르 풀러 공식 호스트 도메인(aws-1-ap-southeast-1.pooler.supabase.com:6543)으로 주소를 새로 조립합니다.
+        DB_CONNECTION = f"postgresql://postgres.{PROJECT_ID}:{DB_PASSWORD}@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
     else:
-        # 기타 예외 구조일 경우 단순 포트 및 유저 바인딩 보정
-        DB_CONNECTION = raw_connection.replace(":5432/", ":6543/").replace("://postgres:", "://postgres.ggnrlfciqinywaodofuo:")
-        
+        DB_CONNECTION = raw_connection
+
 except KeyError:
     st.error("Secrets 설정이 누락되었습니다. Streamlit Advanced Settings를 확인하세요.")
     st.stop()
