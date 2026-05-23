@@ -16,33 +16,18 @@ from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 # 웹 페이지 설정
 st.set_page_config(page_title="RFP 제안서 분석 & 생성 에이전트", layout="wide")
 
-# 프로젝트 정보 고정 설정
-PROJECT_ID = "ggnrlfciqinywaodofuo"
-
-# 1. 시크릿 관리 및 6543 포트용 싱가포르 Pooler 주소 수동 강제 조립
+# 1. 시크릿 관리 (새로 추가한 풀러 전용 시크릿 안전하게 로드)
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-    raw_connection = st.secrets["SUPABASE_DB_CONNECTION"]
     
-    # 1단계: 원래 주소에서 비밀번호 부분만 정확하게 도려냅니다.
-    # postgresql://postgres:[비밀번호]@db.ggnrlfciqinywaodofuo... 또는 pooler 구조 대응
-    try:
-        pw_step1 = raw_connection.split("://postgres:", 1)[1]
-        DB_PASSWORD = pw_step1.split("@", 1)[0]
-    except Exception:
-        # 혹시 분리에 실패할 경우 원본을 그대로 씁니다.
-        DB_CONNECTION = raw_connection
-        DB_PASSWORD = None
-
-    if DB_PASSWORD:
-        # 2단계: 에러를 유발하는 기존 user("postgres") 대신 "postgres.프로젝트ID"로 유저명을 교체하고, 
-        # 싱가포르 풀러 공식 호스트 도메인(aws-1-ap-southeast-1.pooler.supabase.com:6543)으로 주소를 새로 조립합니다.
-        DB_CONNECTION = f"postgresql://postgres.{PROJECT_ID}:{DB_PASSWORD}@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
+    # Secrets에 수동 등록한 완벽한 6543 풀러 주소를 우선 사용합니다.
+    if "SUPABASE_POOLER_CONNECTION" in st.secrets:
+        DB_CONNECTION = st.secrets["SUPABASE_POOLER_CONNECTION"]
     else:
-        DB_CONNECTION = raw_connection
-
+        DB_CONNECTION = st.secrets["SUPABASE_DB_CONNECTION"]
+        
 except KeyError:
     st.error("Secrets 설정이 누락되었습니다. Streamlit Advanced Settings를 확인하세요.")
     st.stop()
