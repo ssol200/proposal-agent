@@ -56,7 +56,6 @@ with tab1:
             if st.button("🔍 RFP 텍스트 분석 시작"):
                 with st.spinner("PDF 파일에서 핵심 텍스트를 추출하는 중..."):
                     try:
-                        # PDF 소프트 리더 가동
                         pdf_reader = PdfReader(rfp_file)
                         extracted_text = ""
                         for page in pdf_reader.pages:
@@ -74,7 +73,7 @@ with tab1:
                         st.error(f"파일 읽기 에러 발생: {e}")
 
 # ==========================================
-# 탭 2: 제안서 빌드 파트 (Gemini 2.0 Flash 직접 가동)
+# 탭 2: 제안서 빌드 파트
 # ==========================================
 with tab2:
     st.subheader("🛠️ AI 제안서 작성 파이프라인")
@@ -86,54 +85,61 @@ with tab2:
         if st.button("🚀 제안서 초안 및 요구사항 검증 시작"):
             with st.status("Gemini 2.0 Flash가 RFP를 분석하여 제안서를 작성 중입니다...", expanded=True) as status:
                 
-                status.update(label="1단계: RFP 요구사항 요약 및 제안서 초안 작성 중...")
+                status.update(label="1단계: 용량 초과 방지 필터링 및 AI 초안 작성 중...")
                 
-                # 구조화된 출력을 위한 JSON Schema 정의
+                # ⚠️ 핵심 안전 장치: 대용량 PDF 압박으로 인한 에러를 방지하기 위해 글자 수 제한을 엄격하게 조정합니다.
+                safe_rfp_context = st.session_state.rfp_text[:4000]
+                
                 prompt = f"""
-                당신은 공공기관 조달청 제안서 작성 전문 AI 에인전트입니다.
+                당신은 공공기관 조달청 제안서 작성 전문 AI 에이전트입니다.
                 다음 제공된 [RFP 내용]을 분석하고, [제안사 역량]을 매칭하여 최적의 제안서를 작성해 주세요.
                 
                 [RFP 내용]
-                {st.session_state.rfp_text[:6000]}  # 안정성을 위해 핵심 분량 컨텍스트 제공
+                {safe_rfp_context}
                 
                 [제안사 역량]
                 {company_spec}
                 
-                출력은 반드시 다른 설명 없는 순수한 JSON 구조로만 해야 하며, 구조는 다음과 같아야 합니다:
+                출력은 다른 설명이 전혀 없는 순수한 JSON 텍스트여야 하며, 반드시 다음 구조를 완벽히 준수해야 합니다.
                 {{
                     "proposal_content": {{
-                        "1. 제안 개요": "RFP 요구사항에 대응하는 제안 목적과 핵심 가치 상세 기술",
-                        "2. 기술 적용 방안": "제안사의 기술 스택을 활용한 구체적인 시스템 아키텍처 및 구현 방안",
-                        "3. 프로젝트 수행 계획": "일정 관리, 인력 투입 및 품질 보증 방안 상세 기술"
+                        "1. 제안 개요": "RFP 요구사항에 대응하는 제안 목적과 가치 상세",
+                        "2. 기술 적용 방안": "제안사의 기술을 활용한 시스템 구현 방안",
+                        "3. 프로젝트 수행 계획": "일정 관리 및 품질 보증 방안"
                     }},
                     "compliance_check": [
-                        {{"요구사항": "핵심 기술 요구사항 항목 1", "충족여부": true, "이유": "제안사 역량 기반 구체적인 매칭 사유"}}
+                        {{"요구사항": "핵심 기술 요구사항 만족 여부", "충족여부": true, "이유": "역량에 기반하여 요구 규격을 충족함"}}
                     ],
                     "fulfillment_rate": 95.0
                 }}
                 """
                 
                 try:
-                    # 최신 정식 규격으로 Gemini 호출
                     response = client.models.generate_content(
                         model='gemini-2.0-flash',
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
-                            temperature=0.2
+                            temperature=0.3
                         )
                     )
                     
-                    # 결과 파싱 및 세션 저장
-                    result_json = json.loads(response.text)
+                    # 텍스트를 깨끗하게 청소한 후 파싱
+                    response_text = response.text.strip()
+                    if response_text.startswith("```json"):
+                        response_text = response_text.replace("```json", "", 1)
+                    if response_text.endswith("```"):
+                        response_text = response_text.rsplit("```", 1)[0]
+                        
+                    result_json = json.loads(response_text.strip())
                     st.session_state.proposal_result = result_json
                     status.update(label="✨ 제안서 및 검증 매트릭스 생성 성공!", state="complete")
                     
                 except Exception as ai_err:
                     status.update(label="❌ 생성 중 에러 발생", state="error")
-                    st.error(f"AI 연동 실패: {ai_err}")
+                    st.error(f"상세 분석 에러 내용: {ai_err}")
             
-            # 생성 결과 화면 출력
+            # 결과 화면 출력
             if st.session_state.proposal_result:
                 res_data = st.session_state.proposal_result
                 st.balloons()
@@ -155,7 +161,7 @@ with tab2:
                     
                 st.markdown("---")
                 
-                # 워드 파일(.docx) 빌드 및 다운로드 제공
+                # 워드 파일(.docx) 다운로드 기능
                 try:
                     doc = Document()
                     doc.add_heading(f"제안서 초안: {st.session_state.rfp_name}", 0)
