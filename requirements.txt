@@ -1,0 +1,12 @@
+streamlit==1.32.0
+llama-index==0.10.20
+llama-index-llms-gemini==0.1.7
+llama-index-embeddings-gemini==0.1.6
+llama-index-vector-stores-supabase==0.1.2
+langchain==0.1.12
+langchain-google-genai==1.0.1
+supabase==2.4.1
+python-docx==1.1.0
+fpdf2==2.7.8
+pydantic==2.6.3
+vecs==0.4.0
