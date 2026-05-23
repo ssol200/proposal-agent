@@ -16,7 +16,7 @@ from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 # 웹 페이지 설정
 st.set_page_config(page_title="RFP 제안서 분석 & 생성 에이전트", layout="wide")
 
-# 1. 시크릿 관리 및 6543 포트 안전 조립 (Direct 주소를 Pooler 주소 구조로 강제 강결합)
+# 1. 시크릿 관리 및 6543 포트 안전 조립
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -25,21 +25,14 @@ try:
     # 5432 기본 Direct 주소를 가져옵니다.
     raw_connection = st.secrets["SUPABASE_DB_CONNECTION"]
     
-    # 팝업창 버그로 Direct 주소(5432)가 고정되어 들어와도, 코드가 실행될 때 AWS 한국 리전의 6543 Pooler 주소 규격으로 강제 재조합합니다.
-    if "@db." in raw_connection:
-        # postgresql://postgres:[password]@db.ggnrlfciqinywaodofuo.supabase.co:5432/postgres 형태 분리
-        prefix_part, domain_part = raw_connection.split("@db.", 1)
-        project_id = domain_part.split(".supabase.co", 1)[0]
-        
-        # password 추출을 위해 prefix에서 postgresql:// 부분을 제외한 실제 pw 세션 파악
-        # 풀러 연동을 위해 유저명 규격을 'postgres.프로젝트ID' 형태로 완벽하게 강제 치환합니다.
-        prefix_fixed = prefix_part.replace("://postgres:", "://postgres.ggnrlfciqinywaodofuo:")
-        
-        # 최종 6543 포트 커넥션 스트링 완성
-        DB_CONNECTION = f"{prefix_fixed}@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres"
+    # 대시보드 UI 버그로 인해 5432 주소가 고정되어 들어와도 코드단에서 강제로 외독 방화벽 패스 규격으로 전처리합니다.
+    if "@db.ggnrlfciqinywaodofuo" in raw_connection:
+        DB_CONNECTION = raw_connection.replace(
+            "@db.ggnrlfciqinywaodofuo.supabase.co:5432/postgres",
+            "@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres"
+        ).replace("://postgres:", "://postgres.ggnrlfciqinywaodofuo:")
     else:
-        # 만약 형식이 다를 경우 단순 문자열 치환 처리
-        DB_CONNECTION = raw_connection.replace(":5432/", ":6543/").replace("db.ggnrlfciqinywaodofuo.supabase.co", "aws-0-ap-northeast-2.pooler.supabase.com")
+        DB_CONNECTION = raw_connection.replace(":5432/", ":6543/")
         
 except KeyError:
     st.error("Secrets 설정이 누락되었습니다. Streamlit Advanced Settings를 확인하세요.")
@@ -62,7 +55,7 @@ def init_llama_index():
     )
     Settings.embed_model = GoogleGenAIEmbedding(
         model_name="models/text-embedding-004",
-        api_key=GEMIGNI_API_KEY if 'GEMIGNI_API_KEY' in locals() else GEMINI_API_KEY
+        api_key=GEMINI_API_KEY
     )
 
 init_llama_index()
@@ -105,14 +98,17 @@ with tab1:
             if st.button("🔍 RFP 지식화 및 인덱싱 시작"):
                 with st.spinner("LlamaIndex 가동 중... PDF 분석 및 Supabase pgvector 저장 중입니다."):
                     try:
+                        # 임시 폴더에 파일 저장
                         with tempfile.TemporaryDirectory() as tmpdir:
                             filepath = os.path.join(tmpdir, rfp_file.name)
                             with open(filepath, "wb") as f:
                                 f.write(rfp_file.getbuffer())
                             
+                            # 문서 로드
                             reader = SimpleDirectoryReader(input_dir=tmpdir)
                             documents = reader.load_data()
                             
+                            # Supabase Vector Store 연결
                             vector_store = SupabaseVectorStore(
                                 postgres_connection_string=DB_CONNECTION,
                                 collection_name="data_rfp_vectors",
@@ -120,6 +116,7 @@ with tab1:
                             )
                             storage_context = StorageContext.from_defaults(vector_store=vector_store)
                             
+                            # 인덱스 생성 및 저장
                             index = VectorStoreIndex.from_documents(
                                 documents, 
                                 storage_context=storage_context
@@ -128,6 +125,7 @@ with tab1:
                             st.session_state.index = index
                             st.session_state.rfp_name = rfp_file.name
                             
+                            # rfp_documents 이력 테이블에 저장
                             supabase.table("rfp_documents").insert({"rfp_name": rfp_file.name}).execute()
                             
                         st.success("🎉 RFP 분석 및 벡터 데이터베이스 저장이 완료되었습니다!")
@@ -149,11 +147,13 @@ with tab2:
             query_engine = st.session_state.index.as_query_engine(similarity_top_k=4)
             
             with st.status("단계별 에이전트 태스크 수행 중...", expanded=True) as status:
+                
                 status.update(label="1단계: RFP 핵심 요구사항 파악 중 (RAG)...")
                 rag_response = query_engine.query("이 제안요청서(RFP)의 핵심 기술적 요구사항과 필수 제출 항목을 요약해줘.")
                 rfp_context = str(rag_response)
                 
                 status.update(label="2단계: 맞춤형 제안서 목차 설계 및 섹션별 초안 작성 중...")
+                
                 prompt_proposal = f"""
                 당신은 공공 입찰 전문 수석 제안서 작성가입니다.
                 다음 RFP 요구사항 내용과 제안사의 역량을 바탕으로 규격에 맞는 제안서 초안을 작성하세요.
@@ -188,6 +188,7 @@ with tab2:
                     }
 
                 status.update(label="3단계: RFP 요구사항 충족도 자체 검증 진행 중...")
+                
                 prompt_compliance = f"""
                 작성된 제안서 초안이 RFP 요구사항을 충족하는지 냉정하게 평가하세요.
                 반드시 아래 구조의 JSON 포맷 리스트로만 답변하세요.
@@ -214,6 +215,7 @@ with tab2:
                 fulfillment_rate = round((true_count / len(compliance_result)) * 100, 1) if compliance_result else 100.0
 
                 status.update(label="4단계: 생성된 제안서 및 검증 결과 데이터베이스(Supabase) 저장 중...")
+                
                 proposal_data = {
                     "rfp_name": st.session_state.rfp_name,
                     "company_name": company_name,
@@ -229,6 +231,7 @@ with tab2:
             st.success(f"📈 최종 RFP 요구사항 충족도 점수: **{fulfillment_rate}%**")
             
             res_col1, res_col2 = st.columns([3, 2])
+            
             with res_col1:
                 st.markdown("### 📝 AI 제안서 초안 결과")
                 for section, content in proposal_sections.items():
