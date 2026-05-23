@@ -22,20 +22,16 @@ try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
     
-    # 기본 연결 주소를 가져옵니다.
-    raw_db_connection = st.secrets["SUPABASE_DB_CONNECTION"]
-    
-    # Streamlit Cloud 환경에서 네트워크 및 SSL 연결 문제를 방지하기 위해 옵션을 안전하게 추가합니다.
-    if "sslmode" not in raw_db_connection:
-        if "?" in raw_db_connection:
-            DB_CONNECTION = f"{raw_db_connection}&sslmode=require"
-        else:
-            DB_CONNECTION = f"{raw_db_connection}?sslmode=require"
-    else:
-        DB_CONNECTION = raw_db_connection
-
-except KeyError as e:
-    st.error(f"Secrets 설정이 누락되었습니다. 누락된 키: {e}")
+    # [수정된 부분] Secrets에 5432 기본 주소가 들어있어도 코드가 실행될 때 6543 풀러 주소로 자동 변환합니다.
+    raw_connection = st.secrets["SUPABASE_DB_CONNECTION"]
+    DB_CONNECTION = (
+        raw_connection
+        .replace(":5432/", ":6543/")
+        .replace("db.ggnrlfciqinywaodofuo.supabase.co", "aws-0-ap-northeast-2.pooler.supabase.com")
+        .replace("://postgres:", "://postgres.ggnrlfciqinywaodofuo:")
+    )
+except KeyError:
+    st.error("Secrets 설정이 누락되었습니다. Streamlit Advanced Settings를 확인하세요.")
     st.stop()
 
 # Supabase 클라이언트 초기화
@@ -219,14 +215,14 @@ with tab2:
                 true_count = sum(1 for item in compliance_result if item.get("충족여부") is True)
                 fulfillment_rate = round((true_count / len(compliance_result)) * 100, 1) if compliance_result else 100.0
 
-                # [6단계] Supabase DB에 최종 데이터 저장 (JSONB 타입 규격 준수)
+                # [6단계] Supabase DB에 최종 데이터 저장 (JSONB 타입 규격 준수 - json.dumps 제거)
                 status.update(label="4단계: 생성된 제안서 및 검증 결과 데이터베이스(Supabase) 저장 중...")
                 
                 proposal_data = {
                     "rfp_name": st.session_state.rfp_name,
                     "company_name": company_name,
-                    "proposal_content": proposal_sections,
-                    "requirements_check": compliance_result,
+                    "proposal_content": proposal_sections,      # JSONB 컬럼이므로 Dict 객체 그대로 대입
+                    "requirements_check": compliance_result,    # JSONB 컬럼이므로 List 객체 그대로 대입
                     "fulfillment_rate": fulfillment_rate
                 }
                 
@@ -285,4 +281,32 @@ with tab2:
             d_col2.info("💡 PDF 변환이 필요하신 경우, 다운로드한 Word 파일을 실행하여 '다른 이름으로 저장 -> PDF' 기능을 이용하세요.")
 
 # =====================
-#
+# 탭 3: 히스토리
+# =====================
+with tab3:
+    st.subheader("📜 과거 제안서 생성 이력")
+    try:
+        response = supabase.table("proposals").select("*").order("created_at", desc=True).limit(50).execute()
+        history_data = response.data
+
+        if history_data:
+            df_history = pd.DataFrame(history_data)
+            st.dataframe(
+                df_history[["created_at", "rfp_name", "company_name", "fulfillment_rate"]],
+                use_container_width=True, hide_index=True
+            )
+
+            selected_id = st.selectbox("상세 보기할 제안서 ID 선택", df_history["id"])
+            if selected_id:
+                detail = next(item for item in history_data if item["id"] == selected_id)
+                if detail.get("proposal_content"):
+                    for sec, txt in detail["proposal_content"].items():
+                        with st.expander(f"📍 {sec}"):
+                            st.write(txt)
+
+            csv = df_history.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("📥 이력 전체 CSV 다운로드", data=csv, file_name="proposal_history.csv", mime="text/csv")
+        else:
+            st.info("아직 생성된 제안서 이력이 없습니다.")
+    except Exception as e:
+        st.error(f"히스토리 데이터를 불러오는 중 에러 발생: {e}")
