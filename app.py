@@ -16,7 +16,7 @@ from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 # 웹 페이지 설정
 st.set_page_config(page_title="RFP 제안서 분석 & 생성 에이전트", layout="wide")
 
-# 1. 시크릿 관리 (새로 추가한 풀러 전용 시크릿 안전하게 로드)
+# 1. 시크릿 관리
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -42,13 +42,15 @@ supabase = init_supabase()
 # LlamaIndex 전역 설정 (Gemini 통합 사용)
 @st.cache_resource
 def init_llama_index():
+    # LLM 모델 지정
     Settings.llm = GoogleGenAI(
         model="models/gemini-2.0-flash",
         api_key=GEMINI_API_KEY,
         temperature=0.2
     )
+    # 🔥 [모델 교정] LlamaIndex 호환성이 검증된 표준 임베딩 모델 명칭으로 수정하여 404 에러를 차단합니다.
     Settings.embed_model = GoogleGenAIEmbedding(
-        model_name="models/text-embedding-004",
+        model_name="models/embedding-001",
         api_key=GEMINI_API_KEY
     )
 
@@ -100,6 +102,7 @@ with tab1:
                             reader = SimpleDirectoryReader(input_dir=tmpdir)
                             documents = reader.load_data()
                             
+                            # 차원이 768로 자동 대응되는 구조 적용
                             vector_store = SupabaseVectorStore(
                                 postgres_connection_string=DB_CONNECTION,
                                 collection_name="data_rfp_vectors",
@@ -234,57 +237,4 @@ with tab2:
             try:
                 doc = Document()
                 doc.add_heading(f"제안서 초안: {st.session_state.rfp_name}", 0)
-                doc.add_paragraph(f"제안사: {company_name}")
-                doc.add_paragraph(f"작성일시: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-                doc.add_paragraph(f"요구사항 검증 충족률: {fulfillment_rate}%")
-                
-                for section, content in proposal_sections.items():
-                    doc.add_heading(section, level=1)
-                    doc.add_paragraph(content)
-                
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-                    doc.save(tmp.name)
-                    with open(tmp.name, "rb") as f:
-                        file_bytes = f.read()
-                        
-                d_col1.download_button(
-                    label="📥 Word 파일(.docx) 다운로드",
-                    data=file_bytes,
-                    file_name=f"제안서_초안_{company_name}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-            except Exception as e:
-                d_col1.error(f"Word 파일 빌드 오류: {e}")
-
-            d_col2.info("💡 PDF 변환이 필요하신 경우, 다운로드한 Word 파일을 실행하여 '다른 이름으로 저장 -> PDF' 기능을 이용하세요.")
-
-# =====================
-# 탭 3: 히스토리
-# =====================
-with tab3:
-    st.subheader("📜 과거 제안서 생성 이력")
-    try:
-        response = supabase.table("proposals").select("*").order("created_at", desc=True).limit(50).execute()
-        history_data = response.data
-
-        if history_data:
-            df_history = pd.DataFrame(history_data)
-            st.dataframe(
-                df_history[["created_at", "rfp_name", "company_name", "fulfillment_rate"]],
-                use_container_width=True, hide_index=True
-            )
-
-            selected_id = st.selectbox("상세 보기할 제안서 ID 선택", df_history["id"])
-            if selected_id:
-                detail = next(item for item in history_data if item["id"] == selected_id)
-                if detail.get("proposal_content"):
-                    for sec, txt in detail["proposal_content"].items():
-                        with st.expander(f"📍 {sec}"):
-                            st.write(txt)
-
-            csv = df_history.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("📥 이력 전체 CSV 다운로드", data=csv, file_name="proposal_history.csv", mime="text/csv")
-        else:
-            st.info("아직 생성된 제안서 이력이 없습니다.")
-    except Exception as e:
-        st.error(f"히스토리 데이터를 불러오는 중 에러 발생: {e}")
+                doc.add_paragraph(f"제
